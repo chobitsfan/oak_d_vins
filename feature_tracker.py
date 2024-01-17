@@ -205,16 +205,34 @@ def create_features_pp(l_prv_features_msg, r_prv_features_msg, l_latest_features
 
     return pp_msg
 
+def create_pp_msg(ts, cam_id, feature_id, cur_un_pts, x, y, vx, vy):
+    pp_msg = PointCloud()
+    pp_msg.header = std_msgs.msg.Header()
+    pp_msg.header.stamp = rospy.Time.from_sec(ts)
+    pp_msg.header.frame_id = 'map'
+    pp_msg.channels = [ChannelFloat32()]*6
+    pp_msg.points.append(Point32(cur_un_pts[0], cur_un_pts[1], 1))
+    pp_msg.channels[0].values.append(feature_id)
+    pp_msg.channels[1].values.append(cam_id)
+    pp_msg.channels[2].values.append(x)
+    pp_msg.channels[3].values.append(y)
+    pp_msg.channels[4].values.append(vx)
+    pp_msg.channels[5].values.append(vy)
+    return pp_msg
+
 base_ts = time.time() - dai.Clock.now().total_seconds()
 
 rospy.init_node('FeatureTracker', anonymous=True, disable_signals=True)
 pp_pub = rospy.Publisher("/feature_tracker/feature", PointCloud, queue_size=10)
 imu_pub = rospy.Publisher("/camera/imu", Imu, queue_size=50)
 
-l_prv_features_msg = None
-r_prv_features_msg = None
-l_latest_features_msg = None
-r_latest_features_msg = None
+l_seq = -1
+r_seq = -2
+disp_seq = -3
+l_prv_features = {}
+r_prv_features = {}
+prv_features_ts = 0
+features_ts = 0
 
 # Create pipeline
 pipeline = dai.Pipeline()
@@ -225,38 +243,28 @@ monoRight = pipeline.create(dai.node.MonoCamera)
 featureTrackerLeft = pipeline.create(dai.node.FeatureTracker)
 featureTrackerRight = pipeline.create(dai.node.FeatureTracker)
 imu = pipeline.create(dai.node.IMU)
+depth = pipeline.create(dai.node.StereoDepth)
 
-#xoutPassthroughFrameLeft = pipeline.create(dai.node.XLinkOut)
 xoutTrackedFeaturesLeft = pipeline.create(dai.node.XLinkOut)
-#xoutPassthroughFrameRight = pipeline.create(dai.node.XLinkOut)
 xoutTrackedFeaturesRight = pipeline.create(dai.node.XLinkOut)
-#xinTrackedFeaturesConfig = pipeline.create(dai.node.XLinkIn)
 xout_imu = pipeline.create(dai.node.XLinkOut)
+xout_disp = pipeline.create(dai.node.XLinkOut)
 
-#xoutPassthroughFrameLeft.setStreamName("passthroughFrameLeft")
 xoutTrackedFeaturesLeft.setStreamName("trackedFeaturesLeft")
-#xoutPassthroughFrameRight.setStreamName("passthroughFrameRight")
 xoutTrackedFeaturesRight.setStreamName("trackedFeaturesRight")
-#xinTrackedFeaturesConfig.setStreamName("trackedFeaturesConfig")
 xout_imu.setStreamName("imu")
-
-warp_l = pipeline.create(dai.node.Warp)
-warp_l.setOutputSize(1280,720)
-warp_l.setMaxOutputFrameSize(1280*720)
-warp_r = pipeline.create(dai.node.Warp)
-warp_r.setOutputSize(1280,720)
-warp_r.setMaxOutputFrameSize(1280*720)
+xout_disp.setStreamName("disparity")
 
 # Properties
-monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
-monoLeft.setFps(30)
+monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+monoLeft.setFps(20)
 monoLeft.setCamera("left")
-monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
-monoRight.setFps(30)
+monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+monoRight.setFps(20)
 monoRight.setCamera("right")
 
-featureTrackerLeft.initialConfig.setNumTargetFeatures(150)
-featureTrackerRight.initialConfig.setNumTargetFeatures(150)
+featureTrackerLeft.initialConfig.setNumTargetFeatures(32)
+featureTrackerRight.initialConfig.setNumTargetFeatures(32)
 
 # enable ACCELEROMETER_RAW at 500 hz rate
 imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, 250)
@@ -270,20 +278,24 @@ imu.setBatchReportThreshold(1)
 # useful to reduce device's CPU load  and number of lost packets, if CPU load is high on device side due to multiple nodes
 imu.setMaxBatchReports(10)
 
-# Linking
-monoLeft.out.link(warp_l.inputImage)
-warp_l.out.link(featureTrackerLeft.inputImage)
-#featureTrackerLeft.passthroughInputImage.link(xoutPassthroughFrameLeft.input)
-featureTrackerLeft.outputFeatures.link(xoutTrackedFeaturesLeft.input)
-#xinTrackedFeaturesConfig.out.link(featureTrackerLeft.inputConfig)
+depth.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
+depth.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
+depth.setLeftRightCheck(True)
+depth.setExtendedDisparity(False)
+depth.setSubpixel(False)
+depth.setDepthAlign(dai.RawStereoDepthConfig.AlgorithmControl.DepthAlign.RECTIFIED_LEFT)
 
-monoRight.out.link(warp_r.inputImage)
-warp_r.out.link(featureTrackerRight.inputImage)
-#featureTrackerRight.passthroughInputImage.link(xoutPassthroughFrameRight.input)
+# Linking
+monoLeft.out.link(depth.left)
+depth.rectifiedLeft.link(featureTrackerLeft.inputImage)
+featureTrackerLeft.outputFeatures.link(xoutTrackedFeaturesLeft.input)
+
+monoRight.out.link(depth.right)
+depth.rectifiedRight.link(featureTrackerRight.inputImage)
 featureTrackerRight.outputFeatures.link(xoutTrackedFeaturesRight.input)
-#xinTrackedFeaturesConfig.out.link(featureTrackerRight.inputConfig)
 
 imu.out.link(xout_imu.input)
+depth.disparity.link(xout_disp.input)
 
 # By default the least mount of resources are allocated
 # increasing it improves performance
@@ -298,60 +310,51 @@ featureTrackerRight.setHardwareResources(numShaves, numMemorySlices)
 # Connect to device and start pipeline
 with dai.Device(pipeline) as device:
     calibData = device.readCalibration()
-    mesh, meshWidth, meshHeight, undist_intri = getMesh(dai.CameraBoardSocket.CAM_B, calibData)
-    warp_l.setWarpMesh(mesh, meshWidth, meshHeight)
-    l_un_fx = undist_intri[0][0]
-    l_un_cx = undist_intri[0][2]
-    l_un_fy = undist_intri[1][1]
-    l_un_cy = undist_intri[1][2]
-    mesh, meshWidth, meshHeight, undist_intri = getMesh(dai.CameraBoardSocket.CAM_C, calibData)
-    warp_r.setWarpMesh(mesh, meshWidth, meshHeight)
-    r_un_fx = undist_intri[0][0]
-    r_un_cx = undist_intri[0][2]
-    r_un_fy = undist_intri[1][1]
-    r_un_cy = undist_intri[1][2]
+    intri = calibData.getCameraIntrinsics(dai.CameraBoardSocket.CAM_B, 640, 400)
+    fx = intri[0][0]
+    cx = intri[0][2]
+    fy = intri[1][1]
+    cy = intri[1][2]
+    l_inv_k11 = 1.0 / fx
+    l_inv_k13 = -cx / fx
+    l_inv_k22 = 1.0 / fy
+    l_inv_k23 = -cy / fy
+    intri = calibData.getCameraIntrinsics(dai.CameraBoardSocket.CAM_C, 640, 400)
+    fx = intri[0][0]
+    cx = intri[0][2]
+    fy = intri[1][1]
+    cy = intri[1][2]
+    r_inv_k11 = 1.0 / fx
+    r_inv_k13 = -cx / fx
+    r_inv_k22 = 1.0 / fy
+    r_inv_k23 = -cy / fy
 
     # Output queues used to receive the results
-    #passthroughImageLeftQueue = device.getOutputQueue("passthroughFrameLeft", 8, False)
     outputFeaturesLeftQueue = device.getOutputQueue("trackedFeaturesLeft", 8, False)
-    #passthroughImageRightQueue = device.getOutputQueue("passthroughFrameRight", 8, False)
     outputFeaturesRightQueue = device.getOutputQueue("trackedFeaturesRight", 8, False)
     imuQueue = device.getOutputQueue(name="imu", maxSize=50, blocking=False)
-
-    #inputFeatureTrackerConfigQueue = device.getInputQueue("trackedFeaturesConfig")
-
-    #leftWindowName = "left"
-    #leftFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", leftWindowName)
-
-    #rightWindowName = "right"
-    #rightFeatureDrawer = FeatureTrackerDrawer("Feature tracking duration (frames)", rightWindowName)
+    disp_queue = device.getOutputQueue(name="disparity", maxSize=8, blocking=False)
 
     device.getQueueEvents()
 
     while True:
-        #inPassthroughFrameLeft = passthroughImageLeftQueue.get()
-        #passthroughFrameLeft = inPassthroughFrameLeft.getFrame()
-        #leftFrame = cv2.cvtColor(passthroughFrameLeft, cv2.COLOR_GRAY2BGR)
-
-        #inPassthroughFrameRight = passthroughImageRightQueue.get()
-        #passthroughFrameRight = inPassthroughFrameRight.getFrame()
-        #rightFrame = cv2.cvtColor(passthroughFrameRight, cv2.COLOR_GRAY2BGR)
-
-        queue_names = device.getQueueEvents(("trackedFeaturesLeft", "trackedFeaturesRight", "imu"))
+        queue_names = device.getQueueEvents(("trackedFeaturesLeft", "trackedFeaturesRight", "imu", "disparity"))
         #print(queue_names)
 
         for queue_name in queue_names:
             if queue_name == "trackedFeaturesLeft":
-                l_prv_features_msg = l_latest_features_msg
-                l_latest_features_msg = outputFeaturesLeftQueue.get()
-                if l_latest_features_msg is not None and r_latest_features_msg is not None and l_latest_features_msg.getSequenceNum() == r_latest_features_msg.getSequenceNum():
-                    pp_pub.publish(create_features_pp(l_prv_features_msg, r_prv_features_msg, l_latest_features_msg, r_latest_features_msg, base_ts, l_un_fx, l_un_fy, l_un_cx, l_un_cy, r_un_fx, r_un_fy, r_un_cx, r_un_cy))
+                features_data = outputFeaturesLeftQueue.get()
+                l_seq = features_data.getSequenceNum()
+                l_features = features_data.trackedFeatures
+                features_ts = features_data.getTimestamp().total_seconds()
             if queue_name == "trackedFeaturesRight":
-                r_prv_features_msg = r_latest_features_msg
-                r_latest_features_msg = outputFeaturesRightQueue.get()
-                if l_latest_features_msg is not None and r_latest_features_msg is not None and l_latest_features_msg.getSequenceNum() == r_latest_features_msg.getSequenceNum():
-                    pp_pub.publish(create_features_pp(l_prv_features_msg, r_prv_features_msg, l_latest_features_msg, r_latest_features_msg, base_ts, l_un_fx, l_un_fy, l_un_cx, l_un_cy, r_un_fx, r_un_fy, r_un_cx, r_un_cy))
-
+                features_data = outputFeaturesRightQueue.get()
+                r_seq = features_data.getSequenceNum()
+                r_features = features_data.trackedFeatures
+            if queue_name == "disparity":
+                disp_data = disp_queue.get()
+                disp_seq = disp_data.getSequenceNum()
+                disp_frame = disp_data.getFrame()
             if queue_name == "imu":
                 imuData = imuQueue.get()
                 imuPackets = imuData.packets
@@ -365,6 +368,72 @@ with dai.Device(pipeline) as device:
                     imu_msg.linear_acceleration = Vector3(acc.z, acc.y, -acc.x)
                     imu_msg.angular_velocity = Vector3(gyro.z, gyro.y, -gyro.x)
                     imu_pub.publish(imu_msg)
+
+            if l_seq == r_seq == disp_seq:
+                l_seq = -1
+                r_seq = -2
+                disp_seq = -3
+                features = {}
+                pp_msg = PointCloud()
+                pp_msg.header = std_msgs.msg.Header()
+                pp_msg.header.stamp = rospy.Time.from_sec(base_ts + features_ts)
+                pp_msg.header.frame_id = 'map'
+                pp_msg.channels = [ChannelFloat32(), ChannelFloat32(), ChannelFloat32(), ChannelFloat32(), ChannelFloat32(), ChannelFloat32()]
+                for feature in l_features:
+                    x = feature.position.x
+                    y = feature.position.y
+                    cur_un_pts = (l_inv_k11 * x + l_inv_k13, l_inv_k22 * y + l_inv_k23)
+                    features[feature.id] = cur_un_pts
+                    row = round(y)
+                    col = round(x)
+                    if col > 639:
+                        col = 639
+                    if row > 399:
+                        row = 399
+                    disp = disp_frame[row, col]
+                    if disp > 0:
+                        for r_feature in r_features:
+                            dy = y - r_feature.position.y
+                            dx = x - disp - r_feature.position.x
+                            if dy * dy + dx * dx <= 36: #pair found
+                                dt = features_ts - prv_features_ts
+                                vx = 0
+                                vy = 0
+                                id = feature.id
+                                if id in l_prv_features:
+                                    vx = (cur_un_pts[0] - l_prv_features[id][0]) / dt
+                                    vy = (cur_un_pts[1] - l_prv_features[id][1]) / dt
+                                pp_msg.points.append(Point32(cur_un_pts[0], cur_un_pts[1], 1))
+                                pp_msg.channels[0].values.append(id)
+                                pp_msg.channels[1].values.append(0)
+                                pp_msg.channels[2].values.append(x)
+                                pp_msg.channels[3].values.append(y)
+                                pp_msg.channels[4].values.append(vx)
+                                pp_msg.channels[5].values.append(vy)
+
+                                x = r_feature.position.x
+                                y = r_feature.position.y
+                                cur_un_pts = (r_inv_k11 * x + r_inv_k13, r_inv_k22 * y + r_inv_k23)
+                                vx = 0
+                                vy = 0
+                                id = r_feature.id
+                                if id in r_prv_features:
+                                    vx = (cur_un_pts[0] - r_prv_features[id][0]) / dt
+                                    vy = (cur_un_pts[1] - r_prv_features[id][1]) / dt
+                                pp_msg.points.append(Point32(cur_un_pts[0], cur_un_pts[1], 1))
+                                pp_msg.channels[0].values.append(feature.id)
+                                pp_msg.channels[1].values.append(1)
+                                pp_msg.channels[2].values.append(x)
+                                pp_msg.channels[3].values.append(y)
+                                pp_msg.channels[4].values.append(vx)
+                                pp_msg.channels[5].values.append(vy)
+                                break
+                pp_pub.publish(pp_msg)
+                l_prv_features = features
+                prv_features_ts = features_ts
+                r_prv_features = {}
+                for feature in r_features:
+                    r_prv_features[feature.id] = (r_inv_k11 * feature.position.x + r_inv_k13, r_inv_k22 * feature.position.y + r_inv_k23)
 #                seq = features_msg.getSequenceNum()
 #                features = features_msg.trackedFeatures
 #                ts = features_msg.getTimestamp().total_seconds()
