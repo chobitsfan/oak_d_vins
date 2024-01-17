@@ -162,7 +162,9 @@ def create_features_pp(l_prv_features_msg, r_prv_features_msg, l_latest_features
         for feature in l_prv_features_msg.trackedFeatures:
             prv_features[feature.id] = feature.position
         dt = l_latest_features_msg.getTimestamp().total_seconds() - l_prv_features_msg.getTimestamp().total_seconds()
+    print("left")
     for feature in l_latest_features_msg.trackedFeatures:
+        print(feature.id)
         x_u = feature.position.x / l_un_fx - l_un_cx / l_un_fx
         y_u = feature.position.y / l_un_fy - l_un_cy / l_un_fy
         pp_msg.points.append(Point32(x_u, y_u, 1))
@@ -183,7 +185,9 @@ def create_features_pp(l_prv_features_msg, r_prv_features_msg, l_latest_features
         for feature in r_prv_features_msg.trackedFeatures:
             prv_features[feature.id] = feature.position
         dt = r_latest_features_msg.getTimestamp().total_seconds() - r_prv_features_msg.getTimestamp().total_seconds()
+    print("right")
     for feature in r_latest_features_msg.trackedFeatures:
+        print(feature.id)
         x_u = feature.position.x / r_un_fx - r_un_cx / r_un_fx
         y_u = feature.position.y / r_un_fy - r_un_cy / r_un_fy
         pp_msg.points.append(Point32(x_u, y_u, 1))
@@ -203,7 +207,7 @@ def create_features_pp(l_prv_features_msg, r_prv_features_msg, l_latest_features
 
 base_ts = time.time() - dai.Clock.now().total_seconds()
 
-rospy.init_node('FeatureTracker', anonymous=True)
+rospy.init_node('FeatureTracker', anonymous=True, disable_signals=True)
 pp_pub = rospy.Publisher("/feature_tracker/feature", PointCloud, queue_size=10)
 imu_pub = rospy.Publisher("/camera/imu", Imu, queue_size=50)
 
@@ -337,7 +341,7 @@ with dai.Device(pipeline) as device:
         #print(queue_names)
 
         for queue_name in queue_names:
-            if queue_name == "trackedFeaturesLeft": 
+            if queue_name == "trackedFeaturesLeft":
                 l_prv_features_msg = l_latest_features_msg
                 l_latest_features_msg = outputFeaturesLeftQueue.get()
                 if l_latest_features_msg is not None and r_latest_features_msg is not None and l_latest_features_msg.getSequenceNum() == r_latest_features_msg.getSequenceNum():
@@ -356,7 +360,7 @@ with dai.Device(pipeline) as device:
                     gyro = imuPacket.gyroscope
                     imu_msg = Imu()
                     imu_msg.header = std_msgs.msg.Header()
-                    imu_msg.header.stamp = rospy.Time.from_sec(base_ts + imuData.getTimestamp().total_seconds())
+                    imu_msg.header.stamp = rospy.Time.from_sec(base_ts + acc.getTimestamp().total_seconds())
                     imu_msg.header.frame_id = 'map'
                     imu_msg.linear_acceleration = Vector3(acc.z, acc.y, -acc.x)
                     imu_msg.angular_velocity = Vector3(gyro.z, gyro.y, -gyro.x)
